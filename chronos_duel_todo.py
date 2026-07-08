@@ -471,15 +471,179 @@ class DuelWorld:
         return True
 
     def evaluate_enemy(self, state: DuelState) -> float:
-        raise NotImplementedError("TODO: implement the utility/evaluation function from Chaos perspective.")
+        # Utility from Chaos's (the enemy's) perspective: positive is good
+        # for Chaos, negative is good for Chronos (the player).
+        if state.php <= 0:
+            return 10000 + state.ehp * 20
+        if state.ehp <= 0:
+            return -10000 - state.php * 20
+
+        distance = manhattan(state.player_pos, state.enemy_pos)
+
+        # HP is what actually wins the duel, so it dominates the score.
+        # We weight it a bit more heavily than the baseline (55 vs 45) and
+        # make the weight itself react to how close either side is to
+        # dying: HP swings matter more when someone is low, since that's
+        # when a couple of points decide the fight.
+        hp_diff = state.ehp - state.php
+        low_hp_urgency = 1.0 + max(0, (6 - min(state.php, state.ehp))) * 0.08
+        score = hp_diff * 55 * low_hp_urgency
+
+        # Energy fuels Beam and Mine, both real damage sources, so being
+        # ahead on energy is a genuine advantage, not just a number.
+        score += (state.eenergy - state.penergy) * 12
+
+        # Being adjacent enables Strike (cheap, reliable 2 damage), so
+        # distance itself is only mildly penalized; the bigger reward for
+        # being close is captured by the Strike-range bonus below.
+        score -= distance * 4
+        if distance <= 1:
+            score += 26
+
+        # Line-of-sight + energy means Beam is available *this turn*, which
+        # is a strong threat/opportunity. We only credit it while energy is
+        # actually available, since a state with sight but no energy can't
+        # act on it yet.
+        enemy_can_beam = self.line_of_sight(state.enemy_pos, state.player_pos, 4) and state.eenergy > 0
+        player_can_beam = self.line_of_sight(state.player_pos, state.enemy_pos, 4) and state.penergy > 0
+        if enemy_can_beam:
+            score += 40
+        if player_can_beam:
+            score -= 34
+
+        # Mines are positional threats: a mine sitting near the opponent is
+        # good for whoever planted it (they'll likely step on it), and a
+        # mine sitting near yourself is a liability you'd want to avoid or
+        # already be clear of. We scale the bonus/penalty by how close the
+        # relevant unit is, so a mine that's about to be triggered matters
+        # far more than a wall paper threat 5 tiles away.
+        for mine in bit_positions(state.emines):
+            score += max(0, 5 - manhattan(state.player_pos, mine)) * 11
+            score -= max(0, 3 - manhattan(state.enemy_pos, mine)) * 6
+        for mine in bit_positions(state.pmines):
+            score -= max(0, 5 - manhattan(state.enemy_pos, mine)) * 11
+            score += max(0, 3 - manhattan(state.player_pos, mine)) * 6
+
+        # Uncollected shards heal + refill energy, so whoever is closer to
+        # an unclaimed shard has a resource-race advantage.
+        for i, shard in enumerate(self.shards):
+            if state.shards & (1 << i):
+                continue
+            score += manhattan(state.player_pos, shard) - manhattan(state.enemy_pos, shard)
+
+        return score
 
 
 def ordered_actions(world: DuelWorld, state: DuelState) -> List[str]:
-    raise NotImplementedError("TODO: optionally order legal actions to improve alpha-beta pruning.")
+    # Move ordering for alpha-beta: the earlier a strong move is tried at
+    # each node, the sooner alpha/beta can tighten and cause a cutoff. A
+    # static "type priority" (baseline's approach) is a decent guess, but a
+    # cheap one-ply lookahead is a much better guess in practice, since it
+    # actually accounts for the current HP/energy/position instead of
+    # assuming Beam is always better than Strike.
+    #
+    # We score each resulting child state with evaluate_enemy() from the
+    # perspective of whoever is about to move (the mover wants a high score
+    # for themselves), then sort best-first. This ordering doesn't change
+    # what the *search* eventually decides -- alpha-beta with any legal
+    # ordering returns the same value as plain minimax -- it only changes
+    # how many branches get pruned before that value is found.
+    actions = world.legal_actions(state)
+    if len(actions) <= 1:
+        return actions
+
+    mover_is_player = state.turn == PLAYER
+
+    def move_score(action: str) -> float:
+        child = world.apply_action(state, action)
+        value = world.evaluate_enemy(child)
+        # evaluate_enemy() is from Chaos's (enemy's) perspective; flip the
+        # sign if the mover is actually the player, so "higher is better
+        # for the side that just moved" in both cases.
+        return value if not mover_is_player else -value
+
+    return sorted(actions, key=move_score, reverse=True)
 
 
 def choose_ai_action(world: DuelWorld, state: DuelState, algorithm: str, perspective: int = ENEMY) -> AiReport:
-    raise NotImplementedError("TODO: implement Minimax, Alpha-Beta, and Expectimax action selection.")
+    depth = {"Minimax": 3, "Alpha-Beta": 5, "Expectimax": 4}.get(algorithm, 4)
+    begin = time.perf_counter()
+    nodes = 0
+
+    def terminal_value(s: DuelState, d: int) -> Optional[float]:
+        nonlocal nodes
+        if d == 0 or world.terminal(s):
+            nodes += 1
+            value = world.evaluate_enemy(s)
+            return value if perspective == ENEMY else -value
+        return None
+
+    def minimax(s: DuelState, d: int) -> float:
+        # Classic Minimax: assumes both sides play optimally. The side to
+        # move at each node maximizes if it's `perspective`, otherwise it
+        # minimizes (since a rational opponent picks what's worst for us).
+        value = terminal_value(s, d)
+        if value is not None:
+            return value
+        actions = world.legal_actions(s)
+        if s.turn == perspective:
+            return max(minimax(world.apply_action(s, action), d - 1) for action in actions)
+        return min(minimax(world.apply_action(s, action), d - 1) for action in actions)
+
+    def alpha_beta(s: DuelState, d: int, alpha: float, beta: float) -> float:
+        # Same guaranteed result as minimax(), but branches that can no
+        # longer affect the final decision are skipped. Trying strong moves
+        # first (via ordered_actions) makes alpha/beta tighten faster,
+        # which means more of the remaining branches get cut off early --
+        # that's the whole payoff of move ordering here.
+        value = terminal_value(s, d)
+        if value is not None:
+            return value
+        actions = ordered_actions(world, s)
+        if s.turn == perspective:
+            best = -math.inf
+            for action in actions:
+                best = max(best, alpha_beta(world.apply_action(s, action), d - 1, alpha, beta))
+                alpha = max(alpha, best)
+                if alpha >= beta:
+                    break  # beta cutoff: the minimizer above already has a better option
+            return best
+        best = math.inf
+        for action in actions:
+            best = min(best, alpha_beta(world.apply_action(s, action), d - 1, alpha, beta))
+            beta = min(beta, best)
+            if alpha >= beta:
+                break  # alpha cutoff: the maximizer above already has a better option
+        return best
+
+    def expectimax(s: DuelState, d: int) -> float:
+        # Like Minimax, but the non-perspective side is modeled as picking
+        # uniformly at random among its legal actions instead of playing
+        # optimally against us -- useful when the opponent isn't assumed to
+        # be a perfect adversary.
+        value = terminal_value(s, d)
+        if value is not None:
+            return value
+        actions = world.legal_actions(s)
+        if s.turn == perspective:
+            return max(expectimax(world.apply_action(s, action), d - 1) for action in actions)
+        return sum(expectimax(world.apply_action(s, action), d - 1) for action in actions) / len(actions)
+
+    best_action = "WAIT"
+    best_score = -math.inf
+    for action in ordered_actions(world, state):
+        child = world.apply_action(state, action)
+        if algorithm == "Minimax":
+            score = minimax(child, depth - 1)
+        elif algorithm == "Expectimax":
+            score = expectimax(child, depth - 1)
+        else:
+            score = alpha_beta(child, depth - 1, -math.inf, math.inf)
+        if score > best_score:
+            best_action = action
+            best_score = score
+    elapsed_ms = (time.perf_counter() - begin) * 1000.0
+    return AiReport(algorithm, best_action, best_score, nodes, depth, elapsed_ms)
 
 
 class ChronosDuel:
