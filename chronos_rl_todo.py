@@ -262,10 +262,61 @@ class QAgent:
         return action
 
     def choose_action(self, state: RState) -> str:
-        raise NotImplementedError("TODO: implement epsilon-greedy action selection.")
+        # With probability epsilon, explore by selecting a random action uniformly.
+        if random.random() < self.epsilon:
+            return random.choice(ACTION_ORDER)
+        
+        # Otherwise, exploit known values by selecting the current greedy action.
+        return self.best_action(state)
 
     def train_episode(self, max_steps: int = 160) -> EpisodeReport:
-        raise NotImplementedError("TODO: run one TD-learning episode for Q-Learning or SARSA.")
+        state = self.env.reset()
+        total_reward = 0.0
+        steps = 0
+        done = False
+        path = [self.env.pos(state)]
+
+        # For SARSA, the initial action must be selected prior to entering the step loop.
+        action = self.choose_action(state)
+
+        while not done and steps < max_steps:
+            if self.algorithm == "Q-Learning":
+                action = self.choose_action(state)
+
+            next_state, reward, done = self.env.step(action)
+            path.append(self.env.pos(next_state))
+            total_reward += reward
+            steps += 1
+
+            if done:
+                target = reward
+            elif self.algorithm == "Q-Learning":
+                # Off-policy target update using the maximum Q-value of the next state.
+                target = reward + self.gamma * max(self.q[(next_state, a)] for a in ACTION_ORDER)
+            else:
+                # On-policy target update using the action selected by the current policy.
+                next_action = self.choose_action(next_state)
+                target = reward + self.gamma * self.q[(next_state, next_action)]
+
+            # Update the state-action value based on the computed temporal difference target.
+            self.q[(state, action)] += self.alpha * (target - self.q[(state, action)])
+
+            state = next_state
+            if self.algorithm == "SARSA" and not done:
+                action = next_action
+
+        # Update learning tracking statistics and decay the exploration rate exponentially.
+        self.episodes += 1
+        self.epsilon = max(0.01, self.epsilon * 0.98)
+        self.last_path = path
+
+        return EpisodeReport(
+            algorithm=self.label(),
+            steps=steps,
+            total_reward=total_reward,
+            reached_terminal=done,
+            message=f"Run complete via {self.algorithm}."
+        )
 
     def train_many(self, count: int) -> EpisodeReport:
         report = EpisodeReport(self.label(), 0, 0.0, False, "")
