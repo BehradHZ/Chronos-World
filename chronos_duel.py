@@ -1086,6 +1086,7 @@ class ChronosDuel:
 
 def main() -> None:
     pygame.init()
+    pygame.joystick.quit()
     pygame.display.set_caption("Chronos Duel: Adversarial Search")
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     game = ChronosDuel(screen)

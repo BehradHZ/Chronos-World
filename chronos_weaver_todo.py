@@ -823,6 +823,7 @@ class ChronosGame:
 
 def main() -> None:
     pygame.init()
+    pygame.joystick.quit()
     pygame.display.set_caption("Chronos Weaver: Search Algorithms")
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     game = ChronosGame(screen)
