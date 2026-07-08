@@ -418,17 +418,20 @@ class ChronosCSP:
                     assignment[var] = value
                     next_domains = self.forward_check(assignment, domains, var, value)
                     if next_domains is not None:
+                        old_best_cost = best["cost"]
                         backtrack(assignment, next_domains)   
+                        if best["cost"] == old_best_cost:
+                            stats["backtracks"] += 1
                     else:
                         stats["backtracks"] += 1
-                    del assignment[var] 
+                    del assignment[var]
 
         initial_domains = {name: list(values) for name, values in self.base_domains.items()}
         backtrack({}, initial_domains)
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         solved = best["assignment"] is not None
-        message = "Signal plan sealed." if solved else "No valid signal pمهمه!lan found."
+        message = "Signal plan sealed." if solved else "No valid signal plan found."
 
         return CspReport(
             algorithm=algorithm,
