@@ -365,7 +365,53 @@ class World:
                 yield action, result[0], result[1]
 
     def heuristic(self, state: SearchState) -> float:
-        raise NotImplementedError("TODO: implement an admissible or useful heuristic for Greedy and A* search.")
+        # Same idea as a plain multi-goal nearest-neighbor tour heuristic:
+        # repeatedly step to the closest remaining objective (fragment or
+        # rift) and sum up Manhattan distances, then add the distance from
+        # the last stop to the Core. Dropping walls/enemies/tile-cost and
+        # only keeping Manhattan distance at FLOOR_COST (the cheapest tile)
+        # keeps every leg a true lower bound, and visiting objectives in
+        # *some* order lower-bounds visiting them in the best order -- so
+        # the estimate never overestimates the true remaining cost.
+        #
+        # Tightened with one piece of domain knowledge: a rift can't be
+        # sealed until enough fragments have been collected. So a rift only
+        # counts as a reachable "next stop" once the running fragment count
+        # (real + collected so far in this tour) meets its requirement.
+        # This never removes required distance -- it only forces the tour to
+        # collect fragments before rifts that need them -- so it stays
+        # admissible while giving a noticeably tighter estimate than
+        # treating every rift as reachable immediately.
+        current = state.pos
+        collected = state.fragments.bit_count()
+
+        todo_fragments = [f for i, f in enumerate(self.fragments) if not (state.fragments & (1 << i))]
+        todo_rifts = [(i, r) for i, r in enumerate(self.rifts) if not (state.rifts & (1 << i))]
+
+        estimate = 0.0
+        while todo_fragments or todo_rifts:
+            reachable_rifts = [(i, r) for i, r in todo_rifts if collected >= self.rift_requirements[i]]
+            # Tag each candidate so we know whether we picked a fragment or
+            # a rift, even if their positions happen to coincide on a map.
+            candidates = [("fragment", -1, f) for f in todo_fragments]
+            candidates += [("rift", i, r) for i, r in reachable_rifts]
+            if not candidates:
+                # Remaining rifts all still need more fragments than are
+                # available; collect fragments first to unblock them.
+                candidates = [("fragment", -1, f) for f in todo_fragments]
+
+            kind, rid, target = min(candidates, key=lambda c: manhattan(current, c[2]))
+            estimate += manhattan(current, target)
+            current = target
+
+            if kind == "fragment":
+                todo_fragments.remove(target)
+                collected += 1
+            else:
+                todo_rifts = [(i, r) for i, r in todo_rifts if i != rid]
+
+        estimate += manhattan(current, self.core)
+        return estimate * FLOOR_COST
 
 
 def manhattan(a: Vec, b: Vec) -> int:
@@ -390,14 +436,104 @@ def reconstruct(
     actions.reverse()
     return states, actions, total
 
-
 def solve(world: World, start: SearchState, algorithm: str, node_limit: int = 90000) -> SearchResult:
-    raise NotImplementedError("TODO: implement BFS, DFS, UCS, Greedy, and A* search here.")
+    begin = time.perf_counter()
+    parent: Dict[SearchState, Tuple[SearchState, str, float]] = {}
+    visited = 0
+    frontier_peak = 1
+
+    if algorithm == "BFS":
+        # BFS explores in strict "wave" order using a FIFO queue. It ignores
+        # tile cost, so the path it finds is shortest in number of steps,
+        # not necessarily cheapest.
+        queue = deque([start])
+        seen = {start}
+        while queue and visited < node_limit:
+            state = queue.popleft()
+            visited += 1
+            if world.is_goal(state):
+                states, actions, cost = reconstruct(state, parent)
+                return result(algorithm, True, states, actions, cost, visited, begin, frontier_peak, "Goal reached")
+            for action, child, move_cost in world.neighbors(state):
+                if child in seen:
+                    continue
+                seen.add(child)
+                parent[child] = (state, action, move_cost)
+                queue.append(child)
+            frontier_peak = max(frontier_peak, len(queue))
+
+    elif algorithm == "DFS":
+        # DFS explores as deep as possible along each branch before
+        # backtracking, using an explicit stack (no recursion, so we avoid
+        # Python's recursion limit on a large state space). A state is
+        # marked seen the moment it's pushed, to avoid infinite loops and
+        # re-expansion of the same state.
+        stack = [start]
+        seen = {start}
+        while stack and visited < node_limit:
+            state = stack.pop()
+            visited += 1
+            if world.is_goal(state):
+                states, actions, cost = reconstruct(state, parent)
+                return result(algorithm, True, states, actions, cost, visited, begin, frontier_peak, "Goal reached")
+            for action, child, move_cost in world.neighbors(state):
+                if child in seen:
+                    continue
+                seen.add(child)
+                parent[child] = (state, action, move_cost)
+                stack.append(child)
+            frontier_peak = max(frontier_peak, len(stack))
+
+    elif algorithm in ("UCS", "Greedy", "A*"):
+        # Shared best-first search for UCS, Greedy, and A*, since all three
+        # differ only in how priority() ranks frontier nodes. A min-heap
+        # (heapq) is the priority queue; each entry carries a tie-breaking
+        # counter so states are never compared directly. We track the best
+        # known g-cost per state and only push/update when a cheaper path
+        # to that state is found (lazy deletion handles stale heap entries).
+        counter = 0
+        g_score: Dict[SearchState, float] = {start: 0.0}
+        heap: List[Tuple[float, int, SearchState]] = [(priority(world, start, 0.0, algorithm), counter, start)]
+        closed: set[SearchState] = set()
+
+        while heap and visited < node_limit:
+            _, _, state = heapq.heappop(heap)
+            if state in closed:
+                continue
+            closed.add(state)
+            visited += 1
+            if world.is_goal(state):
+                states, actions, cost = reconstruct(state, parent)
+                return result(algorithm, True, states, actions, cost, visited, begin, frontier_peak, "Goal reached")
+
+            for action, child, move_cost in world.neighbors(state):
+                new_g = g_score[state] + move_cost
+                if new_g >= g_score.get(child, math.inf):
+                    continue
+                g_score[child] = new_g
+                parent[child] = (state, action, move_cost)
+                counter += 1
+                heapq.heappush(heap, (priority(world, child, new_g, algorithm), counter, child))
+            frontier_peak = max(frontier_peak, len(heap))
+
+    else:
+        return result(algorithm, False, [], [], 0.0, 0, begin, frontier_peak, f"Unknown algorithm: {algorithm}")
+
+    msg = "No plan found" if visited < node_limit else "Node limit reached"
+    return result(algorithm, False, [], [], 0.0, visited, begin, frontier_peak, msg)
 
 
 def priority(world: World, state: SearchState, g: float, algorithm: str) -> float:
-    raise NotImplementedError("TODO: return the frontier priority for UCS, Greedy, and A*.")
-
+    if algorithm == "UCS":
+        # UCS only cares about the true cost accumulated so far.
+        return g
+    if algorithm == "Greedy":
+        # Greedy only cares about the estimated remaining distance.
+        return world.heuristic(state)
+    if algorithm == "A*":
+        # A* balances cost-so-far with estimated cost-to-go: f(n) = g(n) + h(n).
+        return g + world.heuristic(state)
+    raise ValueError(f"priority() does not apply to algorithm: {algorithm}")
 
 def result(
     algorithm: str,
@@ -411,7 +547,6 @@ def result(
     message: str,
 ) -> SearchResult:
     return SearchResult(algorithm, found, states, actions, cost, visited, (time.perf_counter() - begin) * 1000.0, frontier_peak, message)
-
 
 class ChronosGame:
     def __init__(self, screen: pygame.Surface) -> None:
@@ -838,7 +973,6 @@ def main() -> None:
         game.update(dt)
         game.draw()
     pygame.quit()
-
 
 if __name__ == "__main__":
     main()
