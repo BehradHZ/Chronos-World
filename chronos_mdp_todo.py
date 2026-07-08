@@ -211,9 +211,27 @@ class GridMDP:
         return ACTION_ORDER[(index - 1) % 4], ACTION_ORDER[(index + 1) % 4]
 
     def transitions(self, state: State, action: str) -> List[Tuple[State, float, float]]:
-        raise NotImplementedError(
-            "TODO: build the stochastic transition model for intended and side-slip actions."
-        )
+            # Terminal states transition to themselves indefinitely with zero future reward.
+            if self.terminal(state):
+                return [(state, 1.0, 0.0)]
+
+            # Collect the intended movement along with left/right stochastic drift probabilities.
+            left_slip, right_slip = self.side_actions(action)
+            candidates = [
+                (action, 1.0 - self.noise),
+                (left_slip, self.noise / 2.0),
+                (right_slip, self.noise / 2.0)
+            ]
+
+            # Aggregate probabilities for outcomes that resolve to the same destination state.
+            merged_transitions: Dict[State, float] = {}
+            for act, prob in candidates:
+                if prob > 0.0:
+                    next_state = self.move(state, act)
+                    merged_transitions[next_state] = merged_transitions.get(next_state, 0.0) + prob
+
+            # Construct transition tuples mapping destination, probability, and environmental step reward.
+            return [(nxt, prob, self.reward(state, nxt)) for nxt, prob in merged_transitions.items()]
 
     def sample_transition(self, state: State, action: str) -> Tuple[State, float]:
         if self.terminal(state):
@@ -227,7 +245,14 @@ class GridMDP:
         return next_state, self.reward(state, next_state)
 
     def q_value(self, state: State, action: str, values: Optional[Dict[State, float]] = None) -> float:
-        raise NotImplementedError("TODO: compute the Bellman Q-value for one state-action pair.")
+        if values is None:
+            values = self.values
+
+        # Apply the Bellman expectation backup equation across all possible stochastic outcomes.
+        q = 0.0
+        for next_state, prob, reward in self.transitions(state, action):
+            q += prob * (reward + GAMMA * values[next_state])
+        return q
 
     def best_action(self, state: State, values: Optional[Dict[State, float]] = None) -> Tuple[str, float]:
         scored = [(self.q_value(state, action, values), action) for action in ACTION_ORDER]
@@ -235,7 +260,27 @@ class GridMDP:
         return action, value
 
     def value_iteration_step(self) -> MdpReport:
-        raise NotImplementedError("TODO: perform one full value-iteration sweep over all states.")
+        new_values = {}
+        delta = 0.0
+
+        # Synchronously calculate maximum expected utility for each state across the grid.
+        for state in self.states():
+            if self.terminal(state):
+                new_values[state] = 0.0
+            else:
+                _, best_val = self.best_action(state, self.values)
+                new_values[state] = best_val
+                delta = max(delta, abs(new_values[state] - self.values[state]))
+
+        self.values = new_values
+        self.iterations += 1
+        self.last_delta = delta
+        self.update_policy()
+
+        # Check for convergence using standard Bellman residual threshold criteria.
+        stable = delta < 1e-5
+        message = "Route values converged." if stable else "Value iteration step completed."
+        return MdpReport("Value Sweep", self.iterations, delta, stable, message)
 
     def run_value_iteration(self, limit: int = 100) -> MdpReport:
         report = MdpReport("Value Sweep", self.iterations, 0.0, False, "")
@@ -264,14 +309,36 @@ class GridMDP:
             self.values = new_values
 
     def policy_iteration(self, limit: int = 20) -> MdpReport:
-        raise NotImplementedError("TODO: evaluate and improve the route policy until it stabilizes.")
+        stable = False
+        
+        # Alternate between policy evaluation sweeps and greedy policy improvement step routines.
+        for _ in range(limit):
+            self.evaluate_policy()
+            policy_stable = True
+
+            for state in self.states():
+                if self.terminal(state):
+                    continue
+                old_action = self.policy.get(state)
+                best_act, _ = self.best_action(state, self.values)
+                
+                if best_act != old_action:
+                    policy_stable = False
+                self.policy[state] = best_act
+
+            self.iterations += 1
+            if policy_stable:
+                stable = True
+                break
+
+        message = "Route policy stabilized." if stable else f"Ran {limit} policy iteration updates."
+        return MdpReport("Policy Iteration", self.iterations, self.last_delta, stable, message)
 
     def reset(self) -> None:
         self.values = {s: 0.0 for s in self.states()}
         self.policy = {s: "E" for s in self.states() if not self.terminal(s)}
         self.iterations = 0
         self.last_delta = 0.0
-
 
 class ChronosMdpGame:
     def __init__(self, screen: pygame.Surface) -> None:
