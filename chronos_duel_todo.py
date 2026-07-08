@@ -579,9 +579,6 @@ def choose_ai_action(world: DuelWorld, state: DuelState, algorithm: str, perspec
         return None
 
     def minimax(s: DuelState, d: int) -> float:
-        # Classic Minimax: assumes both sides play optimally. The side to
-        # move at each node maximizes if it's `perspective`, otherwise it
-        # minimizes (since a rational opponent picks what's worst for us).
         value = terminal_value(s, d)
         if value is not None:
             return value

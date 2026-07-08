@@ -525,13 +525,13 @@ def solve(world: World, start: SearchState, algorithm: str, node_limit: int = 90
 
 def priority(world: World, state: SearchState, g: float, algorithm: str) -> float:
     if algorithm == "UCS":
-        # UCS only cares about the true cost accumulated so far.
+        # The true cost accumulated so far.
         return g
     if algorithm == "Greedy":
-        # Greedy only cares about the estimated remaining distance.
+        # Estimated remaining distance.
         return world.heuristic(state)
     if algorithm == "A*":
-        # A* balances cost-so-far with estimated cost-to-go: f(n) = g(n) + h(n).
+        # f(n) = g(n) + h(n).
         return g + world.heuristic(state)
     raise ValueError(f"priority() does not apply to algorithm: {algorithm}")
 
