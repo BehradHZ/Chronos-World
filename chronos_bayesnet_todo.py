@@ -176,7 +176,26 @@ class BayesSensorNet:
         return 0 <= pos[0] < GRID_W and 0 <= pos[1] < GRID_H and pos not in self.walls
 
     def likelihood(self, obs: Observation, state: BState) -> float:
-        raise NotImplementedError("TODO: compute the sensor likelihood P(evidence | position, phase).")
+        if obs.kind == "flux":
+            # Check proximity to any active rift zone within a Manhattan distance of 2.
+            near_rift = any(manhattan(self.pos(state), zone) <= 2 for zone in self.rift_zones)
+            high_prob = 0.78 if state[2] or near_rift else 0.18
+            return high_prob if obs.reading == 1 else 1.0 - high_prob
+
+        # Calculate expected distance, incorporating phase distortion offset if applicable.
+        true_dist = manhattan(obs.beacon, self.pos(state)) + (1 if state[2] else 0)
+        error = abs(obs.reading - true_dist)
+
+        # Map the absolute sensor measurement error to its corresponding conditional probability.
+        if error == 0:
+            return 0.62
+        elif error == 1:
+            return 0.22
+        elif error == 2:
+            return 0.10
+        elif error == 3:
+            return 0.04
+        return 0.02
 
     def sample_reading(self, beacon: Vec, kind: str) -> int:
         if kind == "flux":
@@ -201,7 +220,22 @@ class BayesSensorNet:
         return self.report(f"Ping from beacon {self.beacons.index(beacon) + 1}: range {reading}.")
 
     def infer(self, observations: List[Observation]) -> Dict[BState, float]:
-        raise NotImplementedError("TODO: run exact Bayesian inference and normalize the posterior.")
+        unnormalized = {}
+        total = 0.0
+
+        # Compute the joint probability of the prior and the accumulated evidence for each state.
+        for state in self.states:
+            prob = self.prior[state]
+            for obs in observations:
+                prob *= self.likelihood(obs, state)
+            unnormalized[state] = prob
+            total += prob
+
+        # Normalize the posterior distribution, defaulting to the prior if total likelihood is zero.
+        if total == 0.0:
+            return dict(self.prior)
+
+        return {state: prob / total for state, prob in unnormalized.items()}
 
     def position_posterior(self) -> Dict[Vec, float]:
         marginal: Dict[Vec, float] = {}
