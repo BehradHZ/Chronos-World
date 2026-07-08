@@ -290,9 +290,48 @@ class ChronosCSP:
         domains: Dict[str, List[Color]],
         mode: str,
     ) -> str:
-        raise NotImplementedError(
-            "TODO: choose the next relay using plain order, MRV, or MRV with degree tie-breaks."
-        )
+        remaining = []
+        for name in self.variables:
+            if name not in assignment:
+                remaining.append(name)
+
+        if mode == "plain":
+            return remaining[0]
+        
+
+        # Minimum Remaining Values (MRV): pick the variable with the tightest constraints
+        # (smallest remaining valid domain) to fail early if no solution exists.
+        if mode == "mrv":
+            best = remaining[0]
+            for name in remaining:
+                if len(domains[name]) < len(domains[best]):
+                    best = name
+            return best
+
+        # Degree Heuristic: break MRV ties by selecting the variable that imposes constraints
+        # on the largest number of remaining unassigned neighbors.
+        if mode == "degree":
+            min_size = len(domains[remaining[0]])
+            for name in remaining:
+                if len(domains[name]) < min_size:
+                    min_size = len(domains[name])
+
+            tied = []
+            for name in remaining:
+                if len(domains[name]) == min_size:
+                    tied.append(name)
+
+            best = tied[0]
+            best_degree = -1
+            for name in tied:
+                degree = 0
+                for neighbor in self.neighbors[name]:
+                    if neighbor not in assignment:
+                        degree += 1
+                if degree > best_degree:
+                    best_degree = degree
+                    best = name
+            return best
 
     def ordered_values(
         self,
@@ -301,9 +340,22 @@ class ChronosCSP:
         domains: Dict[str, List[Color]],
         use_lcv: bool,
     ) -> List[Color]:
-        raise NotImplementedError(
-            "TODO: order relay frequencies, including Least Constraining Value when requested."
-        )
+        if not use_lcv:
+            return domains[var]
+        
+        # Least Constraining Value (LCV): sort frequencies by how many valid options
+        # they eliminate from neighboring domains, prioritizing choices that maximize flexibility.
+        def count_conflicts(value: Color) -> int:
+            total = 0
+            for neighbor in self.neighbors[var]:
+                if neighbor in assignment:
+                    continue
+                for other in domains[neighbor]:
+                    if not self.constraint_ok(var, value, neighbor, other):
+                        total += 1
+            return total
+
+        return sorted(domains[var], key=count_conflicts)
 
     def forward_check(
         self,
@@ -329,8 +381,65 @@ class ChronosCSP:
         variable_mode: str = "plain",
         use_lcv: bool = False,
     ) -> CspReport:
-        raise NotImplementedError(
-            "TODO: implement backtracking search with quotas, forward checking, MRV, degree, and LCV."
+        start_time = time.perf_counter()
+
+        stats = {"nodes": 0, "backtracks": 0, "checks": 0}
+        best = {"assignment": None, "cost": float("inf")}
+
+        def backtrack(assignment: Dict[str, Color], domains: Dict[str, List[Color]]) -> None:
+            stats["nodes"] += 1
+
+            # Base case: if all variables are assigned, evaluate global ledger rules and cost.
+            if len(assignment) == len(self.variables):
+                if self.complete(assignment):
+                    cost = self.total_cost(assignment)
+                    if cost < best["cost"]:
+                        best["cost"] = cost
+                        best["assignment"] = dict(assignment)   
+                return
+
+            # Cost bounding pruning: abandon branches that already meet or exceed the cost 
+            # of the optimal signal configuration found so far.
+            current_cost = self.total_cost(assignment)
+            if current_cost >= best["cost"]:
+                return
+
+            # Ledger admissibility pruning: verify if remaining domain slots can satisfy exactly 
+            # the frequency usage requirements established by the global quotas.            
+            if not self.quota_possible(assignment, domains):
+                return
+
+            var = self.select_unassigned(assignment, domains, variable_mode)
+
+            values = self.ordered_values(var, assignment, domains, use_lcv)
+
+            for value in values:
+                if self.consistent(assignment, var, value, stats):
+                    assignment[var] = value
+                    next_domains = self.forward_check(assignment, domains, var, value)
+                    if next_domains is not None:
+                        backtrack(assignment, next_domains)   
+                    else:
+                        stats["backtracks"] += 1
+                    del assignment[var] 
+
+        initial_domains = {name: list(values) for name, values in self.base_domains.items()}
+        backtrack({}, initial_domains)
+
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        solved = best["assignment"] is not None
+        message = "Signal plan sealed." if solved else "No valid signal pمهمه!lan found."
+
+        return CspReport(
+            algorithm=algorithm,
+            solved=solved,
+            assignment=best["assignment"] if solved else {},
+            nodes=stats["nodes"],
+            backtracks=stats["backtracks"],
+            checks=stats["checks"],
+            cost=best["cost"] if solved else 0,
+            elapsed_ms=elapsed_ms,
+            message=message,
         )
 
 def line_points(a: Vec, b: Vec) -> Tuple[Vec, Vec]:
