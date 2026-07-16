@@ -5,6 +5,7 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -220,7 +221,7 @@ class TextureAtlas:
 
 
 class World:
-    chosen = "B"
+    chosen = "A"
 
     if chosen == "A":
         layout = [
@@ -264,12 +265,12 @@ class World:
         layout = [
             "S....~~....F.C",
             ".####.~.####..",
-            "....#.~.#..P..",
+            "....#.~.#.....",
             ".##.#...#.##..",
             ".F#.....~.#R..",
             "....###....#..",
             ".##.#...#.##.F",
-            "...P#~~~#....~",
+            "....#~~~#....~",
             ".##.....#.##..",
             "R....#....F...",
         ]
@@ -406,53 +407,127 @@ class World:
                 yield action, result[0], result[1]
 
     def heuristic(self, state: SearchState) -> float:
-        # Same idea as a plain multi-goal nearest-neighbor tour heuristic:
-        # repeatedly step to the closest remaining objective (fragment or
-        # rift) and sum up Manhattan distances, then add the distance from
-        # the last stop to the Core. Dropping walls/enemies/tile-cost and
-        # only keeping Manhattan distance at FLOOR_COST (the cheapest tile)
-        # keeps every leg a true lower bound, and visiting objectives in
-        # *some* order lower-bounds visiting them in the best order -- so
-        # the estimate never overestimates the true remaining cost.
+        # Exact shortest-tour lower bound, built from TWO exact pieces instead
+        # of a hand-rolled distance formula:
         #
-        # Tightened with one piece of domain knowledge: a rift can't be
-        # sealed until enough fragments have been collected. So a rift only
-        # counts as a reachable "next stop" once the running fragment count
-        # (real + collected so far in this tour) meets its requirement.
-        # This never removes required distance -- it only forces the tour to
-        # collect fragments before rifts that need them -- so it stays
-        # admissible while giving a noticeably tighter estimate than
-        # treating every rift as reachable immediately.
-        current = state.pos
-        collected = state.fragments.bit_count()
+        #  1) A real all-pairs-shortest-path table between every passable
+        #     cell, computed once with Dijkstra on the actual movement graph
+        #     (walls respected, tile costs respected, Pads respected exactly
+        #     as step() implements them). Enemies and turn-parity are the
+        #     only things left out -- and leaving them out can only ever
+        #     remove restrictions, never add a shortcut, so every distance
+        #     in this table is a guaranteed lower bound on the true cost
+        #     between those two cells. Because it comes from a real
+        #     shortest-path computation on a graph with valid (non-negative)
+        #     edge weights, it automatically satisfies the triangle
+        #     inequality -- no hand-written formula to get subtly wrong.
+        #
+        #     (An earlier version of this heuristic tried to model Pad
+        #     shortcuts by hand with a closed-form "walk to nearest pad,
+        #     jump, walk from exit" formula. That formula quietly assumed a
+        #     player could chain multiple pad jumps for the price of one,
+        #     which isn't how Pads actually work here -- re-triggering a Pad
+        #     needs a real extra step off and back onto it. That mismatch
+        #     between the formula and the actual step() rules was exactly
+        #     what broke both admissibility and consistency. Running Dijkstra
+        #     on the real graph sidesteps the whole class of bug: it can't
+        #     misunderstand the rules, because it *is* the rules.)
+        #
+        #  2) A Held-Karp style bitmask DP over the remaining objectives
+        #     (fragments + rifts), using those exact distances as edge
+        #     weights, that finds the CHEAPEST legal visiting order instead
+        #     of greedily guessing one. A greedy nearest-neighbor tour is
+        #     *a* valid tour but not necessarily the *shortest* one, so its
+        #     length can overshoot the true remaining cost -- which is what
+        #     broke the original heuristic. Trying every legal order (the
+        #     objective count here is always small) and keeping the minimum
+        #     guarantees the tightest lower bound our simplification allows.
+        #
+        # A rift only becomes a legal "next stop" in the DP once the
+        # fragment count collected so far in that ordering meets its
+        # requirement -- so the DP never proposes an illegal order, but it's
+        # still free to try every legal one and keep the cheapest.
+        self._ensure_distance_table()
 
         todo_fragments = [f for i, f in enumerate(self.fragments) if not (state.fragments & (1 << i))]
         todo_rifts = [(i, r) for i, r in enumerate(self.rifts) if not (state.rifts & (1 << i))]
+        base_collected = state.fragments.bit_count()
 
-        estimate = 0.0
-        while todo_fragments or todo_rifts:
-            reachable_rifts = [(i, r) for i, r in todo_rifts if collected >= self.rift_requirements[i]]
-            # Tag each candidate so we know whether we picked a fragment or
-            # a rift, even if their positions happen to coincide on a map.
-            candidates = [("fragment", -1, f) for f in todo_fragments]
-            candidates += [("rift", i, r) for i, r in reachable_rifts]
-            if not candidates:
-                # Remaining rifts all still need more fragments than are
-                # available; collect fragments first to unblock them.
-                candidates = [("fragment", -1, f) for f in todo_fragments]
+        objectives: List[Tuple[str, int, Vec]] = [("fragment", -1, f) for f in todo_fragments]
+        objectives += [("rift", i, r) for i, r in todo_rifts]
+        n = len(objectives)
+        if n == 0:
+            return self._dist(state.pos, self.core)
 
-            kind, rid, target = min(candidates, key=lambda c: manhattan(current, c[2]))
-            estimate += manhattan(current, target)
-            current = target
+        full_mask = (1 << n) - 1
 
-            if kind == "fragment":
-                todo_fragments.remove(target)
-                collected += 1
-            else:
-                todo_rifts = [(i, r) for i, r in todo_rifts if i != rid]
+        @lru_cache(maxsize=None)
+        def best_remaining(visited_mask: int, current: Vec, extra_collected: int) -> float:
+            if visited_mask == full_mask:
+                return self._dist(current, self.core)
+            best = math.inf
+            for idx in range(n):
+                if visited_mask & (1 << idx):
+                    continue
+                kind, rid, target = objectives[idx]
+                if kind == "rift":
+                    if base_collected + extra_collected < self.rift_requirements[rid]:
+                        continue  # not enough fragments yet in this ordering
+                    leg = self._dist(current, target) + best_remaining(
+                        visited_mask | (1 << idx), target, extra_collected
+                    )
+                else:
+                    leg = self._dist(current, target) + best_remaining(
+                        visited_mask | (1 << idx), target, extra_collected + 1
+                    )
+                if leg < best:
+                    best = leg
+            return best
 
-        estimate += manhattan(current, self.core)
-        return estimate * FLOOR_COST
+        estimate = best_remaining(0, state.pos, 0)
+        best_remaining.cache_clear()
+        return estimate
+
+    def _ensure_distance_table(self) -> None:
+        # Built once (lazily, on first use) and reused for every heuristic()
+        # call: Dijkstra from every passable cell over the real movement
+        # graph (walls, tile costs, and Pad teleports all handled exactly as
+        # step() defines them -- enemies and turn-parity are the only things
+        # dropped, which only relaxes the graph, never shortens it below the
+        # true cost). ~100-150 cells on our maps, so this costs a few tens of
+        # milliseconds at most, once per game.
+        if hasattr(self, "_dist_table"):
+            return
+        dirs = [(1, 0), (-1, 0), (0, -1), (0, 1)]
+        table: Dict[Vec, Dict[Vec, float]] = {}
+        cells = [(x, y) for y in range(GRID_H) for x in range(GRID_W) if self.passable((x, y))]
+        for src in cells:
+            dist: Dict[Vec, float] = {src: 0.0}
+            pq: List[Tuple[float, Vec]] = [(0.0, src)]
+            while pq:
+                d, pos = heapq.heappop(pq)
+                if d > dist.get(pos, math.inf):
+                    continue
+                for dx, dy in dirs:
+                    entry = (pos[0] + dx, pos[1] + dy)
+                    if not self.passable(entry):
+                        continue
+                    new_pos = self.pad_exit(entry)
+                    if not self.passable(new_pos):
+                        continue
+                    cost = self.tile_cost(entry)
+                    if entry != new_pos:
+                        cost += 0.5
+                    nd = d + cost
+                    if nd < dist.get(new_pos, math.inf):
+                        dist[new_pos] = nd
+                        heapq.heappush(pq, (nd, new_pos))
+            table[src] = dist
+        self._dist_table = table
+
+    def _dist(self, a: Vec, b: Vec) -> float:
+        self._ensure_distance_table()
+        return self._dist_table[a].get(b, math.inf)
 
 
 def manhattan(a: Vec, b: Vec) -> int:
