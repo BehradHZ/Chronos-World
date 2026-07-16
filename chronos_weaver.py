@@ -220,7 +220,7 @@ class TextureAtlas:
 
 
 class World:
-    chosen = "B"
+    chosen = "A"
 
     if chosen == "A":
         layout = [
