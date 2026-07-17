@@ -544,12 +544,32 @@ class DuelWorld:
         # already be clear of. We scale the bonus/penalty by how close the
         # relevant unit is, so a mine that's about to be triggered matters
         # far more than a wall paper threat 5 tiles away.
-        for mine in bit_positions(state.emines):
+        #
+        # evaluate_enemy() is the single hottest function in the search
+        # (called once per expanded node, and again for every child during
+        # move ordering), so mine positions are decoded here with a direct
+        # set-bit walk -- cost proportional to the number of mines actually
+        # placed -- instead of bit_positions(), which scans every one of
+        # the GRID_W*GRID_H board cells on every call regardless of how
+        # many mines exist. Same bits, same coordinates, same scoring;
+        # just without visiting empty cells.
+        emines_mask = state.emines
+        while emines_mask:
+            lsb = emines_mask & -emines_mask
+            idx = lsb.bit_length() - 1
+            mine = (idx % GRID_W, idx // GRID_W)
             score += max(0, 5 - manhattan(state.player_pos, mine)) * 11
             score -= max(0, 3 - manhattan(state.enemy_pos, mine)) * 6
-        for mine in bit_positions(state.pmines):
+            emines_mask &= emines_mask - 1
+
+        pmines_mask = state.pmines
+        while pmines_mask:
+            lsb = pmines_mask & -pmines_mask
+            idx = lsb.bit_length() - 1
+            mine = (idx % GRID_W, idx // GRID_W)
             score -= max(0, 5 - manhattan(state.enemy_pos, mine)) * 11
             score += max(0, 3 - manhattan(state.player_pos, mine)) * 6
+            pmines_mask &= pmines_mask - 1
 
         # Uncollected shards heal + refill energy, so whoever is closer to
         # an unclaimed shard has a resource-race advantage.
